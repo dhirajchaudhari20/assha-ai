@@ -1,5 +1,6 @@
+
 import React, { useState, useRef, useCallback, useEffect } from 'react';
-import { recognizeSignLanguage } from './services/geminiService';
+import { recognizeSignLanguage, RateLimitError } from './services/geminiService';
 
 // CSS for UI components (can be moved to a separate file)
 const styles = `
@@ -97,12 +98,14 @@ const App: React.FC = () => {
     const [toastMessage, setToastMessage] = useState('');
     const [fps, setFps] = useState(0);
     const [resolutionLabel, setResolutionLabel] = useState('960×540');
+    const [backoffDelay, setBackoffDelay] = useState(2000); // Initial 2s backoff
 
     // Control refs
     const videoRef = useRef<HTMLVideoElement>(null);
     const canvasRef = useRef<HTMLCanvasElement>(null);
     const streamRef = useRef<MediaStream | null>(null);
-    const recognitionIntervalRef = useRef<number | null>(null);
+    const isRecognizingRef = useRef(false);
+    const recognitionTimeoutRef = useRef<number | null>(null);
     const transcriptRef = useRef<HTMLDivElement>(null);
 
     const frameRateRef = useRef<HTMLSelectElement>(null);
@@ -118,7 +121,7 @@ const App: React.FC = () => {
 
     const showToast = useCallback((msg: string) => {
         setToastMessage(msg);
-        setTimeout(() => setToastMessage(''), 2500);
+        setTimeout(() => setToastMessage(''), 3000);
     }, []);
     
     useEffect(() => {
@@ -155,8 +158,8 @@ const App: React.FC = () => {
             if (streamRef.current) {
                 streamRef.current.getTracks().forEach(track => track.stop());
             }
-            if (recognitionIntervalRef.current) {
-                clearInterval(recognitionIntervalRef.current);
+            if (recognitionTimeoutRef.current) {
+                clearTimeout(recognitionTimeoutRef.current);
             }
         };
     }, []);
@@ -171,6 +174,19 @@ const App: React.FC = () => {
         setStatus(state);
         setStatusText(text);
     };
+    
+    const handleStopRecognition = useCallback(() => {
+        isRecognizingRef.current = false;
+        if (recognitionTimeoutRef.current) {
+            clearTimeout(recognitionTimeoutRef.current);
+            recognitionTimeoutRef.current = null;
+        }
+        setIsRecognizing(false);
+        if (status !== 'err') {
+            updateStatus('idle', 'Stopped');
+        }
+        setFps(0);
+    }, [status]);
 
     const handleStartCamera = useCallback(async () => {
         if (!resolutionRef.current) return;
@@ -198,14 +214,14 @@ const App: React.FC = () => {
     }, [showToast]);
 
     const handleStopCamera = useCallback(() => {
-        if (isRecognizing) handleStopRecognition();
+        if (isRecognizingRef.current) handleStopRecognition();
         if (streamRef.current) {
             streamRef.current.getTracks().forEach(track => track.stop());
             streamRef.current = null;
         }
         setIsCameraOn(false);
         updateStatus('idle', 'Idle');
-    }, [isRecognizing]);
+    }, [handleStopRecognition]);
 
     const speak = useCallback((text: string) => {
         if (isMuted || !text || !voices.length || !voiceSelectRef.current || !rateRef.current || !pitchRef.current) return;
@@ -221,13 +237,11 @@ const App: React.FC = () => {
         window.speechSynthesis.cancel();
         window.speechSynthesis.speak(utterance);
     }, [isMuted, voices]);
-
-    const captureAndProcessFrame = useCallback(async () => {
-        if (!videoRef.current || !canvasRef.current || videoRef.current.readyState < 2) {
+    
+    const processFrameLoop = useCallback(async () => {
+        if (!isRecognizingRef.current || !videoRef.current || !canvasRef.current || videoRef.current.readyState < 2) {
             return;
         }
-        
-        updateStatus('live', 'Recognizing...');
         
         const video = videoRef.current;
         const canvas = canvasRef.current;
@@ -235,13 +249,16 @@ const App: React.FC = () => {
         canvas.height = video.videoHeight;
         
         const context = canvas.getContext('2d');
-        if (context) {
-            context.drawImage(video, 0, 0, canvas.width, canvas.height);
-            const base64Data = canvas.toDataURL('image/jpeg', 0.8).split(',')[1];
-            
-            const selectedVoice = voices[parseInt(voiceSelectRef.current?.value ?? '0', 10)];
-            const langCode = selectedVoice?.lang.split('-')[0] || 'en';
+        if (!context) { return; }
 
+        context.drawImage(video, 0, 0, canvas.width, canvas.height);
+        const base64Data = canvas.toDataURL('image/jpeg', 0.8).split(',')[1];
+        
+        const selectedVoice = voices[parseInt(voiceSelectRef.current?.value ?? '0', 10)];
+        const langCode = selectedVoice?.lang.split('-')[0] || 'en';
+            
+        try {
+            updateStatus('live', 'Recognizing...');
             const result = await recognizeSignLanguage(base64Data, langCode);
 
             if (result && result !== transcript[transcript.length - 1]?.text) {
@@ -249,8 +266,26 @@ const App: React.FC = () => {
                 setTranscript(prev => [...prev, { time, text: result }]);
                 speak(result);
             }
+            
+            // On success, reset backoff and schedule next frame normally
+            if (status === 'err') { setBackoffDelay(2000); }
+            updateStatus('live', 'Streaming...');
+            const interval = 1000 / parseFloat(frameRateRef.current?.value || '0.5');
+            recognitionTimeoutRef.current = window.setTimeout(processFrameLoop, interval);
+
+        } catch (err) {
+            if (err instanceof RateLimitError) {
+                updateStatus('err', 'Rate Limited');
+                showToast(`Rate limit hit. Retrying in ${backoffDelay / 1000}s...`);
+                recognitionTimeoutRef.current = window.setTimeout(processFrameLoop, backoffDelay);
+                setBackoffDelay(prev => Math.min(prev * 2, 30000)); // Double delay up to 30s
+            } else {
+                updateStatus('err', 'API Error');
+                showToast((err as Error).message);
+                handleStopRecognition();
+            }
+            return;
         }
-        updateStatus('live', 'Streaming...');
 
         // Update FPS counter
         frameCountRef.current++;
@@ -261,26 +296,17 @@ const App: React.FC = () => {
             lastFpsTickRef.current = now;
         }
 
-    }, [speak, voices, transcript]);
+    }, [speak, voices, transcript, showToast, handleStopRecognition, status, backoffDelay]);
 
     const handleStartRecognition = useCallback(() => {
-        if (!isCameraOn || isRecognizing || !frameRateRef.current) return;
+        if (!isCameraOn || isRecognizingRef.current) return;
 
+        isRecognizingRef.current = true;
         setIsRecognizing(true);
         updateStatus('live', 'Starting...');
-        const interval = 1000 / parseInt(frameRateRef.current.value, 10);
-        recognitionIntervalRef.current = window.setInterval(captureAndProcessFrame, interval);
-    }, [isCameraOn, isRecognizing, captureAndProcessFrame]);
+        processFrameLoop(); // Start the loop
+    }, [isCameraOn, processFrameLoop]);
 
-    const handleStopRecognition = useCallback(() => {
-        if (recognitionIntervalRef.current) {
-            clearInterval(recognitionIntervalRef.current);
-            recognitionIntervalRef.current = null;
-        }
-        setIsRecognizing(false);
-        updateStatus('idle', 'Stopped');
-        setFps(0);
-    }, []);
 
     const handleDownload = () => {
         const content = transcript.map(l => `[${l.time}] ${l.text}`).join('\n');
@@ -298,7 +324,6 @@ const App: React.FC = () => {
     const handleFabClick = () => {
         if (!isCameraOn) {
             handleStartCamera().then(() => {
-                // Wait a moment for camera to initialize before starting recognition
                 setTimeout(handleStartRecognition, 500);
             });
             return;
@@ -354,16 +379,16 @@ const App: React.FC = () => {
                             <button onClick={handleStartCamera} className="primary capture" disabled={isCameraOn}><span className="icon">videocam</span> Start Camera</button>
                             <button onClick={handleStartRecognition} className="primary capture" disabled={!isCameraOn || isRecognizing}><span className="icon">fiber_manual_record</span> Start Recognition</button>
                             <button onClick={handleStopRecognition} className="ghost" disabled={!isRecognizing}><span className="icon">stop</span> Stop</button>
+                            <button onClick={handleStopCamera} className="ghost" disabled={!isCameraOn}><span className="icon">videocam_off</span> Stop Camera</button>
                             <button onClick={handleDownload} className="ghost" disabled={transcript.length === 0}><span className="icon">download</span> Transcript</button>
                         </div>
                         
                         <div className="controls" style={{ marginTop: '10px' }}>
                             <label className="chip">Frame rate
-                                <select ref={frameRateRef} defaultValue="2" style={{ marginLeft: '8px' }}>
-                                    <option value="1">1 fps</option>
-                                    <option value="2">2 fps</option>
-                                    <option value="3">3 fps</option>
-                                    <option value="5">5 fps</option>
+                                <select ref={frameRateRef} defaultValue="0.5" style={{ marginLeft: '8px' }}>
+                                    <option value="0.5">0.5 fps (Slow)</option>
+                                    <option value="1">1 fps (Normal)</option>
+                                    <option value="2">2 fps (Fast)</option>
                                 </select>
                             </label>
                             <label className="chip">Resolution
@@ -398,6 +423,7 @@ const App: React.FC = () => {
                                   <span>{line.text}</span>
                               </div>
                           ))}
+                          {transcript.length === 0 && <div style={{textAlign: 'center', color: 'var(--muted)', paddingTop: '40px'}}>Transcript will appear here...</div>}
                       </div>
                     </aside>
                 </div>
@@ -417,7 +443,7 @@ const App: React.FC = () => {
                     </div>
                     <ol style={{ margin: 0, paddingLeft: '18px', lineHeight: 1.7 }}>
                         <li>Click <strong>Start Camera</strong> and grant permission.</li>
-                        <li>Choose a Frame rate and Resolution for your network.</li>
+                        <li>Choose a Frame rate and Resolution for your network. (Slower is safer for API limits).</li>
                         <li>Select a preferred voice for speech output.</li>
                         <li>Press <strong>Start Recognition</strong>. Signs will be translated in the transcript and spoken aloud.</li>
                     </ol>
