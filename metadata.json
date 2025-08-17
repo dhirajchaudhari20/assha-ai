@@ -1,0 +1,8 @@
+{
+  "name": "Sign Language to Speech AI",
+  "description": "A real-time sign language interpreter that uses your device's camera to capture gestures, the Gemini API to recognize them, and converts them into spoken words.",
+  "requestFramePermissions": [
+    "camera",
+    "microphone"
+  ]
+}
